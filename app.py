@@ -1,144 +1,313 @@
 # ==============================================================================
 # IMPORTS
 # ==============================================================================
-import pandas as pd  # Data manipulation, time-series cleaning, and resampling
-import requests  # HTTP client for calling the live OpenAQ REST API
-import streamlit as st  # Web dashboard UI framework
+from pathlib import Path  # Cross-platform file path handling for the built-in CSV
+
+import pandas as pd  # Data loading, cleaning, time-series resampling, and tables
+import requests  # HTTP client for live nearby sensor lookups via the OpenAQ API
+import streamlit as st  # Interactive web dashboard framework
 from sklearn.ensemble import HistGradientBoostingRegressor  # Gradient boosting model for forecasting
-from sklearn.metrics import mean_absolute_error  # Evaluation metric (average error in µg/m³)
-from sklearn.model_selection import train_test_split  # Used to demonstrate why random splits leak time
+from sklearn.metrics import mean_absolute_error  # Measures average prediction error
+from sklearn.model_selection import train_test_split  # Demonstrates why random splits leak future data
 
 
 # ==============================================================================
 # PAGE CONFIGURATION & HEADER
 # ==============================================================================
-# Configure the browser tab title, full-width page layout, and cloud icon
+# Set browser tab title, wide responsive layout, and cloud icon
 st.set_page_config(
     page_title="Air Sense Forecasting Dashboard",
     layout="wide",
     page_icon=":cloud:",
 )
 
-# Display the main dashboard heading and an explanatory disclaimer caption
+# Main dashboard title and universal description (works for any city or air quality index/pollutant)
 st.title("Air Sense Forecasting Dashboard")
 st.caption(
-    "This app works with PM2.5 concentration measurements, not a precomputed AQI. "
-    "Its watch level is user-defined and is not medical guidance."
+    "Universal air quality & environmental forecasting platform. Explore the built-in multi-city dataset "
+    "or upload your own CSV to inspect cleaned history, recurring patterns, honest model validation, "
+    "future forecasts, custom watch-level alerts, and live OpenAQ sensor readings."
 )
+
+
+# ==============================================================================
+# CONSTANTS & REFERENCE METADATA
+# ==============================================================================
+# Path to the predefined dataset bundled alongside app.py
+DEFAULT_DATASET_PATH = Path(__file__).resolve().parent / "default_air_quality.csv"
+
+# Standard measurement units for common air quality and weather columns
+METRIC_UNITS = {
+    "AQI": "AQI",
+    "PM2.5": "µg/m³",
+    "PM10": "µg/m³",
+    "Ozone": "ppb",
+    "NO2": "ppb",
+    "CO": "ppm",
+    "SO2": "ppb",
+    "Temperature": "°C",
+    "Humidity": "%",
+}
+
+# Predefined WGS84 coordinates (latitude, longitude) for cities in the built-in dataset
+# so the OpenAQ live sensor lookup auto-fills coordinates convenience-first
+CITY_COORDINATES = {
+    "Austin": (30.2672, -97.7431),
+    "Charlotte": (35.2271, -80.8431),
+    "Chicago": (41.8781, -87.6298),
+    "Columbus": (39.9612, -82.9988),
+    "Dallas": (32.7767, -96.7970),
+    "Fort Worth": (32.7555, -97.3308),
+    "Houston": (29.7604, -95.3698),
+    "Jacksonville": (30.3322, -81.6557),
+    "Los Angeles": (34.0522, -118.2437),
+    "New York": (40.7128, -74.0060),
+    "Philadelphia": (39.9526, -75.1652),
+    "Phoenix": (33.4484, -112.0740),
+    "San Antonio": (29.4241, -98.4936),
+    "San Diego": (32.7157, -117.1611),
+    "San Jose": (37.3382, -121.8863),
+}
 
 
 # ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
-def prepare_series(frame, timestamp_column, value_column):
-    """Clean raw CSV columns into a regular, gap-filled UTC PM2.5 time series."""
-    # Keep only the user-selected timestamp and PM2.5 columns and standardize their names
-    selected = frame[[timestamp_column, value_column]].copy()
-    selected.columns = ["timestamp", "pm25"]
+@st.cache_data(show_spinner=False)
+def load_builtin_dataset(path_str):
+    """Load and cache the predefined CSV dataset from disk."""
+    return pd.read_csv(path_str)
 
-    # Parse timestamps into UTC datetimes; invalid strings become NaT (missing)
-    selected["timestamp"] = pd.to_datetime(
-        selected["timestamp"], errors="coerce", utc=True
+
+def detect_columns(frame):
+    """Automatically identify timestamp, location/category, and numeric value columns."""
+    columns = frame.columns.tolist()
+
+    # 1. Detect the best timestamp column by common names or datetime parse rate
+    timestamp_candidates = []
+    for col in columns:
+        col_lower = str(col).strip().lower()
+        if any(key in col_lower for key in ("date", "time", "timestamp", "datetime")):
+            timestamp_candidates.append(col)
+
+    if not timestamp_candidates:
+        for col in columns:
+            if pd.api.types.is_numeric_dtype(frame[col]):
+                continue
+            sample = frame[col].dropna().astype(str).head(50)
+            if len(sample) > 0:
+                parsed = pd.to_datetime(sample, errors="coerce", utc=True)
+                if parsed.notna().mean() >= 0.7:
+                    timestamp_candidates.append(col)
+
+    default_timestamp = timestamp_candidates[0] if timestamp_candidates else columns[0]
+
+    # 2. Detect numeric-capable columns (excluding the timestamp column)
+    numeric_columns = []
+    for col in columns:
+        if col == default_timestamp:
+            continue
+        converted = pd.to_numeric(frame[col], errors="coerce")
+        if converted.notna().sum() >= 5 and converted.notna().mean() >= 0.3:
+            numeric_columns.append(col)
+
+    # 3. Detect optional location/grouping columns (e.g. City, Station, Location, Country)
+    group_columns = []
+    for col in columns:
+        if col == default_timestamp or col in numeric_columns:
+            continue
+        nunique = frame[col].dropna().nunique()
+        if 1 < nunique <= 200:
+            group_columns.append(col)
+
+    # Prioritize common location names first if multiple categorical columns exist
+    group_columns.sort(
+        key=lambda c: 0
+        if any(k in str(c).lower() for k in ("city", "location", "station", "site", "region", "country"))
+        else 1
     )
-    # Convert PM2.5 readings to numbers; non-numeric text becomes NaN (missing)
-    selected["pm25"] = pd.to_numeric(selected["pm25"], errors="coerce")
 
-    # Drop any rows where either the timestamp or PM2.5 reading was invalid/missing
+    return default_timestamp, numeric_columns, group_columns
+
+
+def get_unit_for_column(column_name):
+    """Return a clean display unit for known metrics, or an empty string for custom columns."""
+    if column_name in METRIC_UNITS:
+        return METRIC_UNITS[column_name]
+    lower = str(column_name).lower()
+    if "pm2.5" in lower or "pm25" in lower or "pm10" in lower:
+        return "µg/m³"
+    if "aqi" in lower:
+        return "AQI"
+    if "temp" in lower:
+        return "°C"
+    if "humid" in lower:
+        return "%"
+    return "units"
+
+
+def prepare_series(frame, timestamp_column, value_column, clip_outliers=True, custom_horizon=None):
+    """Clean raw rows into a gap-filled time series and configure cadence-appropriate lags."""
+    # Extract only the timestamp and target metric columns
+    selected = frame[[timestamp_column, value_column]].copy()
+    selected.columns = ["timestamp", "value"]
+
+    # Convert timestamps to UTC and target values to numeric floats (invalid entries become NaN)
+    selected["timestamp"] = pd.to_datetime(selected["timestamp"], errors="coerce", utc=True)
+    selected["value"] = pd.to_numeric(selected["value"], errors="coerce")
+    raw_valid_rows = int(selected["timestamp"].notna().sum())
+    missing_values = int(selected["value"].isna().sum())
+
+    # Remove rows missing either a valid timestamp or numeric measurement
     selected = selected.dropna()
+    if len(selected) < 8:
+        raise ValueError(
+            f"The selected columns only contain {len(selected)} valid numeric rows. "
+            "At least 8 valid observations are required to build a forecast."
+        )
 
-    # Average duplicate timestamps (if multiple rows share a timestamp) and sort chronologically
-    series = selected.groupby("timestamp")["pm25"].mean().sort_index()
-    if len(series) < 3:
-        raise ValueError("The selected columns contain fewer than three usable rows.")
+    # Average duplicate timestamps (e.g. multiple readings on the same date/hour) and sort chronologically
+    series = selected.groupby("timestamp")["value"].mean().sort_index()
+    if len(series) < 8:
+        raise ValueError(
+            f"After grouping duplicate timestamps, only {len(series)} unique time points remain. "
+            "Choose a more granular filter or upload a longer history."
+        )
 
-    # Compute the median time gap between consecutive readings to detect hourly vs. daily data
+    # Optionally clip extreme sensor malfunction spikes using a generous 3.5x IQR fence
+    outliers_clipped = 0
+    if clip_outliers and len(series) >= 12:
+        q1 = float(series.quantile(0.25))
+        q3 = float(series.quantile(0.75))
+        iqr = q3 - q1
+        if iqr > 0:
+            lower_fence = q1 - 3.5 * iqr
+            upper_fence = q3 + 3.5 * iqr
+            outlier_mask = (series < lower_fence) | (series > upper_fence)
+            outliers_clipped = int(outlier_mask.sum())
+            series = series.clip(lower=lower_fence, upper=upper_fence)
+
+    # Detect whether readings are hourly (median gap <= 6h) or daily
     median_gap = series.index.to_series().diff().dropna().median()
-    if median_gap <= pd.Timedelta(hours=6):
-        # Treat datasets with gaps <= 6 hours as hourly data: forecast next 24 hours
+    if pd.notna(median_gap) and median_gap <= pd.Timedelta(hours=6):
         cadence = "h"
         cadence_label = "hourly"
-        horizon = 24
-        # Lags capture recent hours (1, 2, 3), same hour yesterday (24), and same hour last week (168)
-        lags = [1, 2, 3, 24, 168]
-        rolling_window = 24
+        default_horizon = 24
+        preferred_lags = [1, 2, 3, 24, 168]
+        preferred_window = 24
     else:
-        # Otherwise treat as daily data: forecast next 7 days
         cadence = "D"
         cadence_label = "daily"
-        horizon = 7
-        # Lags capture recent days (1, 2, 3), 1 week ago (7), and 2 weeks ago (14)
-        lags = [1, 2, 3, 7, 14]
-        rolling_window = 7
+        default_horizon = 14
+        preferred_lags = [1, 2, 3, 7, 14]
+        preferred_window = 7
 
-    # Put the series onto a regular hourly/daily grid and linearly interpolate missing steps
-    series = series.resample(cadence).mean().interpolate().dropna()
-    series.name = "pm25"
-    return series, cadence, cadence_label, horizon, lags, rolling_window
+    # Resample onto a uniform hourly or daily grid and linearly fill missing gaps
+    series = series.resample(cadence).mean().interpolate(method="time").bfill().ffill().dropna()
+    series.name = value_column
+
+    horizon = int(custom_horizon) if custom_horizon is not None else default_horizon
+
+    # Dynamically adapt lags & rolling window if a user uploads a shorter custom dataset
+    # so the app never crashes with an insufficient-row error on smaller CSVs
+    max_allowed_lag = max(1, len(series) - max(horizon, 5) - 6)
+    lags = [lag for lag in preferred_lags if lag <= max_allowed_lag]
+    if not lags:
+        lags = [1]
+    rolling_window = min(preferred_window, max(2, max_allowed_lag))
+
+    # Clamp horizon if series is very short
+    horizon = min(horizon, max(3, len(series) // 3))
+
+    stats = {
+        "raw_valid_rows": raw_valid_rows,
+        "missing_values": missing_values,
+        "outliers_clipped": outliers_clipped,
+    }
+    return series, cadence, cadence_label, horizon, lags, rolling_window, stats
 
 
-def make_features(series, lags, rolling_window):
-    """Build supervised learning features (past lags + rolling average) from the time series."""
+def make_features(series, lags, rolling_window, cadence):
+    """Create lag, rolling-statistics, and calendar seasonality features for supervised learning."""
     features = pd.DataFrame(index=series.index)
 
-    # Create lag columns (e.g., lag_1 = value 1 step ago, lag_24 = value 24 steps ago)
+    # Past values at specific lag offsets (lag_1, lag_2, ...)
     for lag in lags:
         features[f"lag_{lag}"] = series.shift(lag)
 
-    # Compute the rolling average of past values (shifted by 1 so we never peek at the current target)
-    features["rolling_mean"] = series.shift(1).rolling(rolling_window).mean()
+    # Shifted rolling mean & rolling std so we summarize recent history without leaking current target
+    shifted = series.shift(1)
+    features["rolling_mean"] = shifted.rolling(rolling_window).mean()
+    features["rolling_std"] = shifted.rolling(rolling_window).std().fillna(0.0)
 
-    # The value we want the model to predict at each timestamp
+    # Calendar cycle features help capture recurring daily/weekly/seasonal patterns
+    if cadence == "h":
+        features["hour"] = series.index.hour
+        features["day_of_week"] = series.index.day_of_week
+    else:
+        features["day_of_week"] = series.index.day_of_week
+        features["month"] = series.index.month
+
     features["target"] = series
-
-    # Drop initial warm-up rows where lag or rolling window values are not yet available
     return features.dropna()
 
 
 def make_model():
-    """Create a reproducible Histogram-based Gradient Boosting Regressor."""
+    """Build a regularized Histogram-based Gradient Boosting Regressor resistant to sensor noise."""
     return HistGradientBoostingRegressor(
-        random_state=42,       # Fixed seed so results are repeatable
-        min_samples_leaf=5,    # Prevents overfitting on tiny leaf groups
-        early_stopping=False,  # Train all trees consistently across small/medium datasets
+        random_state=42,
+        max_depth=3,
+        max_iter=80,
+        learning_rate=0.05,
+        min_samples_leaf=10,
+        l2_regularization=3.0,
+        early_stopping=False,
     )
 
 
 def forecast_future(model, series, feature_columns, lags, rolling_window, cadence, horizon):
-    """Generate multi-step future predictions recursively (feeding each prediction into the next step)."""
+    """Predict multiple future steps recursively by feeding each step's prediction into the next."""
     history = series.copy()
     predictions = []
     timestamps = []
-
-    # Step forward by 1 hour for hourly data, or 1 day for daily data
     step = pd.Timedelta(hours=1) if cadence == "h" else pd.Timedelta(days=1)
 
     for _ in range(horizon):
         next_timestamp = history.index[-1] + step
-
-        # Build the single-row feature input for `next_timestamp` from the end of `history`
         row = {}
-        for lag in lags:
-            row[f"lag_{lag}"] = history.iloc[-lag]
-        row["rolling_mean"] = history.iloc[-rolling_window:].mean()
 
-        # Predict the next PM2.5 value using the trained model
+        # Populate lag features from the tail of `history`
+        for lag in lags:
+            row[f"lag_{lag}"] = float(history.iloc[-lag])
+
+        # Populate rolling statistics from recent history
+        recent_slice = history.iloc[-rolling_window:]
+        row["rolling_mean"] = float(recent_slice.mean())
+        row["rolling_std"] = float(recent_slice.std()) if len(recent_slice) > 1 else 0.0
+
+        # Populate calendar features for `next_timestamp`
+        if cadence == "h":
+            row["hour"] = next_timestamp.hour
+            row["day_of_week"] = next_timestamp.day_of_week
+        else:
+            row["day_of_week"] = next_timestamp.day_of_week
+            row["month"] = next_timestamp.month
+
+        # Predict and append to `history` for the next recursive step
         row_frame = pd.DataFrame([row], columns=feature_columns)
         prediction = float(model.predict(row_frame)[0])
-
-        # Append prediction to `history` so subsequent future steps can use it as lag input
         history.loc[next_timestamp] = prediction
         timestamps.append(next_timestamp)
         predictions.append(prediction)
 
-    return pd.Series(predictions, index=timestamps, name="Forecast PM2.5")
+    return pd.Series(predictions, index=timestamps, name=f"Forecast {series.name}")
 
 
 def fetch_nearby_openaq(api_key, latitude, longitude):
-    """Find the closest OpenAQ PM2.5 sensor within 25 km and fetch its last 7 days of hourly readings."""
-    # Authenticate with the user's OpenAQ v3 API key via request header
-    headers = {"X-API-Key": api_key}
+    """Query OpenAQ v3 for the closest PM2.5 sensor within 25 km and return its last 7 days of hourly data."""
+    headers = {"X-API-Key": api_key.strip()}
 
-    # Step 1: Query OpenAQ /v3/locations within a 25,000m (25 km) radius for PM2.5 (parameters_id=2)
+    # Search nearby monitoring locations within a 25 km radius for PM2.5 (parameters_id=2)
     location_response = requests.get(
         "https://api.openaq.org/v3/locations",
         headers=headers,
@@ -151,44 +320,38 @@ def fetch_nearby_openaq(api_key, latitude, longitude):
         },
         timeout=20,
     )
-    location_response.raise_for_status()  # Raise an error if HTTP status is 4xx/5xx
+    location_response.raise_for_status()
     locations = location_response.json().get("results", [])
 
-    # Collect all candidate PM2.5 sensors (parameter id == 2) along with provider & license attribution
+    # Collect candidate PM2.5 sensors and preserve provider & license attribution
     candidates = []
     for location in locations:
         for sensor in location.get("sensors", []):
             if sensor.get("parameter", {}).get("id") == 2:
                 licenses = location.get("licenses") or []
                 attribution = "See OpenAQ metadata"
-                if licenses:
-                    attribution = licenses[0].get("attribution", {}).get(
-                        "name", attribution
-                    )
+                if licenses and isinstance(licenses[0], dict):
+                    attribution = (licenses[0].get("attribution") or {}).get("name", attribution)
                 candidates.append(
                     {
                         "distance": location.get("distance"),
                         "location": location.get("name") or "Unnamed location",
-                        "provider": location.get("provider", {}).get(
-                            "name", "Unknown provider"
-                        ),
+                        "provider": (location.get("provider") or {}).get("name", "Unknown provider"),
                         "attribution": attribution,
                         "sensor_id": sensor["id"],
                     }
                 )
 
     if not candidates:
-        raise ValueError("No PM2.5 sensor was returned within 25 km.")
+        raise ValueError("No OpenAQ PM2.5 sensor was found within 25 km of those coordinates.")
 
-    # Pick the physically closest PM2.5 sensor to the given coordinates
+    # Select the physically nearest sensor
     closest = min(
         candidates,
-        key=lambda item: item["distance"]
-        if item["distance"] is not None
-        else float("inf"),
+        key=lambda item: item["distance"] if item["distance"] is not None else float("inf"),
     )
 
-    # Step 2: Fetch the last 7 days of hourly averages from that closest sensor
+    # Fetch recent hourly measurements over the past 7 days
     end = pd.Timestamp.now(tz="UTC")
     start = end - pd.Timedelta(days=7)
     sensor_id = closest["sensor_id"]
@@ -205,7 +368,6 @@ def fetch_nearby_openaq(api_key, latitude, longitude):
     )
     hourly_response.raise_for_status()
 
-    # Extract UTC timestamp and PM2.5 value from each returned hourly record
     rows = []
     for item in hourly_response.json().get("results", []):
         period = item.get("period") or {}
@@ -217,101 +379,250 @@ def fetch_nearby_openaq(api_key, latitude, longitude):
             }
         )
 
-    # Clean and sort the live sensor readings into a tidy DataFrame
     live = pd.DataFrame(rows)
     if live.empty:
-        raise ValueError("The selected sensor returned no hourly rows for the last week.")
+        raise ValueError(
+            f"Sensor {sensor_id} ({closest['location']}) is registered nearby, "
+            "but reported no hourly readings in the last 7 days."
+        )
     live["timestamp"] = pd.to_datetime(live["timestamp"], errors="coerce", utc=True)
     live["value"] = pd.to_numeric(live["value"], errors="coerce")
     live = live.dropna().sort_values("timestamp")
     if live.empty:
-        raise ValueError("The returned hourly rows had no usable timestamps and values.")
+        raise ValueError("The returned hourly records contained no usable timestamps and values.")
 
     return closest, live
 
 
 # ==============================================================================
-# STEP 1: CSV UPLOAD & COLUMN MAPPING
+# SIDEBAR: DATA SOURCE (BUILT-IN DATASET + CUSTOM CSV UPLOAD) & CONFIGURATION
 # ==============================================================================
-# Prompt user to upload a CSV file; pause execution cleanly until a file is provided
-uploaded_file = st.file_uploader("Upload the Pokhara CSV", type=["csv"])
-if uploaded_file is None:
-    st.info("Upload the Pokhara CSV to begin.")
-    st.stop()
+with st.sidebar:
+    st.header("1. Data Source")
 
-# Safely load the uploaded CSV into a pandas DataFrame
-try:
-    raw = pd.read_csv(uploaded_file)
-except Exception as exc:
-    st.error(f"The CSV could not be read: {exc}")
-    st.stop()
+    # Allow user to upload any custom CSV dataset whenever they want
+    uploaded_file = st.file_uploader(
+        "Upload custom CSV dataset (optional)",
+        type=["csv"],
+        help="Leave empty to use the predefined multi-city air quality dataset, or upload your own CSV.",
+    )
 
-# Ensure there are at least two columns (one for time, one for PM2.5)
+    # Let the user switch cleanly between their uploaded file and the built-in dataset
+    if uploaded_file is not None:
+        source_choice = st.radio(
+            "Active dataset",
+            options=["Uploaded CSV", "Built-in Air Quality Dataset"],
+            index=0,
+        )
+    else:
+        source_choice = "Built-in Air Quality Dataset"
+        st.caption("Using predefined multi-city dataset (`default_air_quality.csv`).")
+
+
+# Load whichever dataset is active, with friendly error handling
+if source_choice == "Uploaded CSV" and uploaded_file is not None:
+    try:
+        raw = pd.read_csv(uploaded_file)
+        active_dataset_name = f"Uploaded CSV ({uploaded_file.name})"
+    except Exception as exc:
+        st.error(f"Could not read the uploaded CSV file: {exc}")
+        st.stop()
+else:
+    if not DEFAULT_DATASET_PATH.exists():
+        st.error(
+            "Built-in dataset `default_air_quality.csv` was not found next to `app.py`. "
+            "Please upload a CSV file in the sidebar."
+        )
+        st.stop()
+    raw = load_builtin_dataset(str(DEFAULT_DATASET_PATH))
+    active_dataset_name = "Built-in Multi-City Air Quality Dataset (2023–2024)"
+
+# Validate minimum column structure
 if len(raw.columns) < 2:
-    st.error("The CSV needs at least two columns.")
+    st.error("The dataset must contain at least two columns (a timestamp column and a numeric metric column).")
     st.stop()
 
-# Let the user map which column holds timestamps and which holds PM2.5 values
-timestamp_column = st.selectbox("Timestamp column", raw.columns.tolist())
-value_column = st.selectbox("PM2.5 concentration column", raw.columns.tolist())
-if timestamp_column == value_column:
-    st.warning("Choose different timestamp and PM2.5 columns.")
-    st.stop()
+# Automatically detect timestamp, numeric metrics, and optional city/location grouping columns
+default_ts_col, detected_numeric_cols, detected_group_cols = detect_columns(raw)
+
+with st.sidebar:
+    st.header("2. Series Selection")
+
+    # Timestamp column selector (auto-defaults to Date / timestamp)
+    all_columns = raw.columns.tolist()
+    ts_default_idx = all_columns.index(default_ts_col) if default_ts_col in all_columns else 0
+    timestamp_column = st.selectbox("Timestamp column", all_columns, index=ts_default_idx)
+
+    # Optional City / Location filter when dataset contains a grouping column like `City`
+    selected_group_col = None
+    selected_city = None
+    filtered_frame = raw
+
+    available_group_cols = [c for c in detected_group_cols if c != timestamp_column]
+    if available_group_cols:
+        selected_group_col = st.selectbox(
+            "Filter by location / category",
+            options=available_group_cols + ["None (Aggregate all rows)"],
+            index=0,
+        )
+        if selected_group_col != "None (Aggregate all rows)":
+            unique_groups = sorted(raw[selected_group_col].dropna().astype(str).unique().tolist())
+            selected_city = st.selectbox(
+                f"Select {selected_group_col}",
+                options=["All (Daily Average)"] + unique_groups,
+                index=0,
+            )
+            if selected_city != "All (Daily Average)":
+                filtered_frame = raw[raw[selected_group_col].astype(str) == selected_city].copy()
+
+    # Build safe list of numeric metric columns (never colliding with timestamp_column!)
+    candidate_value_cols = [
+        col for col in all_columns
+        if col != timestamp_column and col != selected_group_col
+        and pd.to_numeric(filtered_frame[col], errors="coerce").notna().sum() >= 5
+    ]
+    if not candidate_value_cols:
+        st.error(
+            "No numeric measurement columns with at least 5 valid numbers were found. "
+            "Please upload a CSV containing numeric air quality or sensor values."
+        )
+        st.stop()
+
+    # Default to PM2.5 if present, otherwise AQI, otherwise the first numeric column
+    if "PM2.5" in candidate_value_cols:
+        val_default_idx = candidate_value_cols.index("PM2.5")
+    elif "AQI" in candidate_value_cols:
+        val_default_idx = candidate_value_cols.index("AQI")
+    else:
+        val_default_idx = 0
+
+    value_column = st.selectbox(
+        "Target metric to forecast",
+        options=candidate_value_cols,
+        index=val_default_idx,
+    )
+
+    st.header("3. Forecast Settings")
+    forecast_steps = st.slider(
+        "Forecast horizon (steps ahead)",
+        min_value=3,
+        max_value=30,
+        value=14,
+        help="Number of future days (or hours, for hourly data) to predict.",
+    )
+    clip_outliers = st.checkbox(
+        "Smooth extreme sensor spikes (IQR filter)",
+        value=True,
+        help="Clips extreme single-day sensor glitches (beyond 3.5x IQR) so they don't distort charts or training.",
+    )
 
 
 # ==============================================================================
-# STEP 2: CLEAN SERIES, SUMMARY METRICS & RECURRING PATTERNS
+# STEP 1: PREPARE & VALIDATE TIME SERIES
 # ==============================================================================
-# Clean the raw data and detect whether the series is hourly or daily
+unit = get_unit_for_column(value_column)
+scope_label = (
+    f"{selected_city}"
+    if selected_city and selected_city != "All (Daily Average)"
+    else "All Locations (Aggregated)"
+)
+
 try:
-    series, cadence, cadence_label, horizon, lags, rolling_window = prepare_series(
-        raw, timestamp_column, value_column
+    series, cadence, cadence_label, horizon, lags, rolling_window, clean_stats = prepare_series(
+        filtered_frame,
+        timestamp_column,
+        value_column,
+        clip_outliers=clip_outliers,
+        custom_horizon=forecast_steps,
     )
 except ValueError as exc:
     st.error(str(exc))
     st.stop()
 
-# Ensure the cleaned time series is long enough to create lags and still train/evaluate
-minimum_rows = max(lags) + horizon + 20
-if len(series) < minimum_rows:
-    st.error(
-        f"The cleaned {cadence_label} series needs at least {minimum_rows} rows "
-        f"for these lags and forecast horizon. It currently has {len(series)}."
-    )
+
+# ==============================================================================
+# STEP 2: OVERVIEW KPIs, DATASET PREVIEW & MULTI-CITY SNAPSHOT
+# ==============================================================================
+st.markdown(f"**Active Source:** `{active_dataset_name}` &nbsp;|&nbsp; **Scope:** `{scope_label}` &nbsp;|&nbsp; **Metric:** `{value_column} ({unit})`")
+
+kpi_1, kpi_2, kpi_3, kpi_4 = st.columns(4)
+kpi_1.metric("Cleaned Observations", f"{len(series):,}")
+kpi_2.metric("Detected Cadence", cadence_label.capitalize())
+kpi_3.metric(f"Average {value_column}", f"{series.mean():.2f} {unit}")
+kpi_4.metric("Forecast Horizon", f"{horizon} {cadence_label} steps")
+
+with st.expander("Inspect raw dataset preview & data-cleaning summary"):
+    info_col1, info_col2, info_col3 = st.columns(3)
+    info_col1.metric("Valid Timestamp Rows", f"{clean_stats['raw_valid_rows']:,}")
+    info_col2.metric("Missing Values Handled", f"{clean_stats['missing_values']:,}")
+    info_col3.metric("Extreme Spikes Smoothed", f"{clean_stats['outliers_clipped']:,}")
+    st.dataframe(filtered_frame.head(50))
+
+# If dataset has multiple cities/locations, offer a quick cross-location comparison bar chart
+if selected_group_col and selected_group_col in raw.columns:
+    with st.expander(f"Compare average {value_column} across all {selected_group_col}s"):
+        city_means = (
+            raw.assign(_num=pd.to_numeric(raw[value_column], errors="coerce"))
+            .groupby(selected_group_col)["_num"]
+            .mean()
+            .dropna()
+            .sort_values(ascending=False)
+            .rename(f"Mean {value_column} ({unit})")
+        )
+        st.bar_chart(city_means)
+
+
+# ==============================================================================
+# STEP 3: CLEANED HISTORY & RECURRING SEASONAL PATTERNS
+# ==============================================================================
+st.subheader(f"Historical {value_column} ({scope_label})")
+st.line_chart(pd.DataFrame({f"Observed {value_column} ({unit})": series}))
+
+st.subheader("Recurring Patterns")
+pat_col1, pat_col2 = st.columns(2)
+
+with pat_col1:
+    if cadence == "h":
+        # Average by hour of day (0..23 UTC) for hourly data
+        hourly_pattern = series.groupby(series.index.hour).mean()
+        hourly_pattern.index.name = "UTC Hour (0–23)"
+        st.caption(f"Average {value_column} by Hour of Day")
+        st.line_chart(pd.DataFrame({f"Mean {value_column}": hourly_pattern}))
+    else:
+        # Average by day of week (Monday=0 .. Sunday=6) for daily data
+        weekday_names = ["0-Mon", "1-Tue", "2-Wed", "3-Thu", "4-Fri", "5-Sat", "6-Sun"]
+        weekday_pattern = series.groupby(series.index.day_of_week).mean()
+        weekday_pattern.index = [weekday_names[i] for i in weekday_pattern.index]
+        weekday_pattern.index.name = "Day of Week"
+        st.caption(f"Weekly Cycle — Mean {value_column} by Day of Week")
+        st.bar_chart(pd.DataFrame({f"Mean {value_column}": weekday_pattern}))
+
+with pat_col2:
+    # Average by calendar month to reveal seasonal winter/summer trends
+    month_names = [
+        "01-Jan", "02-Feb", "03-Mar", "04-Apr", "05-May", "06-Jun",
+        "07-Jul", "08-Aug", "09-Sep", "10-Oct", "11-Nov", "12-Dec",
+    ]
+    monthly_pattern = series.groupby(series.index.month).mean()
+    monthly_pattern.index = [month_names[m - 1] for m in monthly_pattern.index]
+    monthly_pattern.index.name = "Month"
+    st.caption(f"Seasonal Cycle — Mean {value_column} by Month")
+    st.bar_chart(pd.DataFrame({f"Mean {value_column}": monthly_pattern}))
+
+
+# ==============================================================================
+# STEP 4: MODEL EVIDENCE — RANDOM LEAKAGE CHECK VS. HONEST CHRONOLOGICAL HOLDOUT
+# ==============================================================================
+features = make_features(series, lags, rolling_window, cadence)
+if len(features) < 8:
+    st.warning("Not enough feature rows after lag warm-up to train the forecasting model. Upload more rows.")
     st.stop()
 
-# Show 3 high-level KPI metrics summarizing the cleaned series
-summary_1, summary_2, summary_3 = st.columns(3)
-summary_1.metric("Usable observations", len(series))
-summary_2.metric("Detected cadence", cadence_label)
-summary_3.metric("Forecast horizon", f"{horizon} {cadence_label} steps")
-
-# Plot the cleaned historical PM2.5 time series
-st.subheader("Historical PM2.5")
-st.line_chart(pd.DataFrame({"Observed PM2.5": series}))
-
-# Plot the average daily cycle (by UTC hour) or weekly cycle (by day of week)
-st.subheader("Recurring pattern")
-if cadence == "h":
-    pattern = series.groupby(series.index.hour).mean()
-    pattern.index.name = "UTC hour"
-else:
-    pattern = series.groupby(series.index.day_of_week).mean()
-    pattern.index.name = "Weekday number, Monday=0"
-st.line_chart(pd.DataFrame({"Mean PM2.5": pattern}))
-
-
-# ==============================================================================
-# STEP 3: MODEL EVALUATION — RANDOM SPLIT LEAKAGE VS. HONEST CHRONOLOGICAL SPLIT
-# ==============================================================================
-# Build lag and rolling-mean features X and target values y
-features = make_features(series, lags, rolling_window)
-feature_columns = [column for column in features.columns if column != "target"]
+feature_columns = [col for col in features.columns if col != "target"]
 X = features[feature_columns]
 y = features["target"]
 
-# 3A. Demonstrate why a shuffled random train/test split is misleading on time-series data:
-# future timestamps end up inside X_train_random, leaking information across time
+# 4A. Shuffled Random Split (demonstrates time-series data leakage)
 X_train_random, X_test_random, y_train_random, y_test_random = train_test_split(
     X, y, test_size=0.2, random_state=42
 )
@@ -319,42 +630,59 @@ random_model = make_model()
 random_model.fit(X_train_random, y_train_random)
 random_predictions = random_model.predict(X_test_random)
 random_mae = mean_absolute_error(y_test_random, random_predictions)
-random_mix = X_train_random.index.max() > X_test_random.index.min()
+random_mix = bool(X_train_random.index.max() > X_test_random.index.min())
 
-st.subheader("The tempting random split")
-st.warning(f"Random split mixes time: {random_mix}")
-st.metric("Random-split MAE", f"{random_mae:.2f} µg/m³")
-
-# 3B. Perform an honest chronological split: train strictly on the past, test strictly on the latest 20%
-test_size = max(horizon, int(len(X) * 0.2))
+# 4B. Honest Chronological Split (trains strictly on past, evaluates strictly on latest 20%)
+test_size = max(min(horizon, len(X) // 3), int(len(X) * 0.2))
+test_size = max(2, min(test_size, len(X) - 4))
 split_at = len(X) - test_size
-X_train = X.iloc[:split_at]
-X_test = X.iloc[split_at:]
-y_train = y.iloc[:split_at]
-y_test = y.iloc[split_at:]
+
+X_train, X_test = X.iloc[:split_at], X.iloc[split_at:]
+y_train, y_test = y.iloc[:split_at], y.iloc[split_at:]
 
 chronological_model = make_model()
 chronological_model.fit(X_train, y_train)
 chronological_predictions = chronological_model.predict(X_test)
 chronological_mae = mean_absolute_error(y_test, chronological_predictions)
 
-# Benchmark against a naive "persistence" baseline (predicting that the next step equals `lag_1`)
+# 4C. Naive Lag-1 Persistence Baseline (predicts next value == previous value)
 persistence_predictions = X_test["lag_1"]
 persistence_mae = mean_absolute_error(y_test, persistence_predictions)
-chronology_ok = X_train.index.max() < X_test.index.min()
+chronology_ok = bool(X_train.index.max() < X_test.index.min())
 
-st.subheader("Honest future holdout")
-st.success(f"Chronological split keeps train before test: {chronology_ok}")
-metric_1, metric_2, metric_3 = st.columns(3)
-metric_1.metric("Random MAE", f"{random_mae:.2f} µg/m³")
-metric_2.metric("Chronological MAE", f"{chronological_mae:.2f} µg/m³")
-metric_3.metric("Persistence MAE", f"{persistence_mae:.2f} µg/m³")
+st.subheader("Model Evidence & Validation")
+val_left, val_right = st.columns(2)
+with val_left:
+    st.warning(f"Shuffled random split mixes future into training: **{random_mix}** (leaky evaluation)")
+with val_right:
+    st.success(f"Chronological holdout keeps training strictly before test: **{chronology_ok}** (honest evaluation)")
+
+m_col1, m_col2, m_col3 = st.columns(3)
+m_col1.metric(
+    "Chronological Model MAE (Honest)",
+    f"{chronological_mae:.2f} {unit}",
+    delta=f"{chronological_mae - persistence_mae:+.2f} vs persistence",
+    delta_color="inverse",
+)
+m_col2.metric("Lag-1 Persistence Baseline MAE", f"{persistence_mae:.2f} {unit}")
+m_col3.metric("Random-Split MAE (Time-Leaked)", f"{random_mae:.2f} {unit}")
+
+# Plot actual vs predicted on the chronological holdout window so model accuracy is visually transparent
+holdout_comparison = pd.DataFrame(
+    {
+        f"Actual {value_column}": y_test,
+        f"Model Predicted {value_column}": chronological_predictions,
+    },
+    index=y_test.index,
+)
+st.caption("Chronological Holdout Validation — Actual vs. Model Predictions on Unseen Recent Period")
+st.line_chart(holdout_comparison)
 
 
 # ==============================================================================
-# STEP 4: FUTURE PM2.5 FORECAST & USER-DEFINED WATCH LEVEL
+# STEP 5: FUTURE RECURSIVE FORECAST & USER-DEFINED WATCH LEVEL
 # ==============================================================================
-# Refit the model on 100% of available historical data before forecasting into the future
+# Train final model on all available historical observations before forecasting ahead
 final_model = make_model()
 final_model.fit(X, y)
 forecast = forecast_future(
@@ -367,69 +695,120 @@ forecast = forecast_future(
     horizon,
 )
 
-# Plot recent observed PM2.5 alongside the recursive future forecast
-st.subheader("Future PM2.5 forecast")
+st.subheader(f"Future {value_column} Forecast ({horizon} {cadence_label} steps)")
+history_tail = max(horizon * 3, 30)
 forecast_chart = pd.concat(
-    [series.tail(horizon * 3).rename("Observed PM2.5"), forecast], axis=1
+    [
+        series.tail(history_tail).rename(f"Observed {value_column}"),
+        forecast.rename(f"Forecast {value_column}"),
+    ],
+    axis=1,
 )
 st.line_chart(forecast_chart)
 
-# Default the custom watch threshold to the historical 90th percentile, editable by the user
+# Interactive user-defined watch threshold (defaults to the 90th percentile of historical values)
 watch_default = float(round(series.quantile(0.90), 1))
-watch_level = st.number_input(
-    "User-defined watch level (µg/m³)",
-    min_value=0.0,
-    value=watch_default,
-    step=1.0,
-)
+watch_col1, watch_col2 = st.columns([1, 2])
+with watch_col1:
+    watch_level = st.number_input(
+        f"User-defined watch level ({unit})",
+        min_value=float(min(0.0, float(series.min()))),
+        value=watch_default,
+        step=1.0,
+        help="Periods at or above this user-selected threshold are flagged below (not medical guidance).",
+    )
 
-# Flag each forecasted period that meets or exceeds the user's watch level
-forecast_table = pd.DataFrame({"forecast_pm25": forecast})
-forecast_table["at_or_above_watch_level"] = forecast_table["forecast_pm25"] >= watch_level
-st.dataframe(forecast_table.round(2))
+forecast_table = pd.DataFrame(
+    {
+        f"forecast_{value_column.lower()}": forecast.round(2),
+        "watch_level": round(watch_level, 2),
+        "at_or_above_watch_level": forecast >= watch_level,
+    }
+)
+forecast_table.index.name = "Forecast Timestamp (UTC)"
 
 watch_count = int(forecast_table["at_or_above_watch_level"].sum())
-if watch_count:
-    st.warning(f"{watch_count} forecast periods meet or exceed the watch level.")
-else:
-    st.info("No forecast periods meet the current watch level.")
+with watch_col2:
+    if watch_count:
+        st.warning(
+            f"**{watch_count}** of the next **{horizon}** forecast periods meet or exceed "
+            f"your watch level of **{watch_level:.1f} {unit}**."
+        )
+    else:
+        st.info(
+            f"None of the next **{horizon}** forecast periods exceed "
+            f"your watch level of **{watch_level:.1f} {unit}**."
+        )
+
+st.dataframe(forecast_table)
+
+# Allow users to download the generated forecast table as a CSV
+st.download_button(
+    label="Download Forecast CSV",
+    data=forecast_table.to_csv().encode("utf-8"),
+    file_name=f"airsense_forecast_{value_column.lower()}.csv",
+    mime="text/csv",
+)
 
 
 # ==============================================================================
-# STEP 5: LIVE NEARBY SENSOR CONTEXT FROM OPENAQ
+# STEP 6: LIVE NEARBY SENSOR READINGS VIA OPENAQ API
 # ==============================================================================
-st.subheader("Recent OpenAQ PM2.5 context")
-st.caption("Enter the API key at runtime. It is not stored by this app.")
+st.subheader("Live Nearby Sensor Readings (OpenAQ)")
+st.caption(
+    "Enter your OpenAQ v3 API key at runtime to pull the last 7 days of live hourly PM2.5 readings "
+    "from the nearest monitoring station within 25 km. Your API key is never stored."
+)
 
-# Collect OpenAQ API key (masked password input) and WGS84 coordinates at runtime
-api_key = st.text_input("OpenAQ API key", type="password")
-latitude_text = st.text_input("Latitude from the Pokhara data or metadata")
-longitude_text = st.text_input("Longitude from the Pokhara data or metadata")
+# Pre-fill coordinates if the selected city is in our known city dictionary; otherwise default to Los Angeles
+default_lat, default_lon = CITY_COORDINATES.get(selected_city or "", (34.0522, -118.2437))
 
-# Fetch and display live nearby PM2.5 readings only when the user clicks the button
+oaq_col1, oaq_col2, oaq_col3 = st.columns(3)
+with oaq_col1:
+    api_key = st.text_input("OpenAQ API key", type="password", placeholder="Paste OpenAQ v3 API key")
+with oaq_col2:
+    latitude_text = st.text_input("Latitude (WGS84)", value=f"{default_lat:.4f}")
+with oaq_col3:
+    longitude_text = st.text_input("Longitude (WGS84)", value=f"{default_lon:.4f}")
+
 if st.button("Fetch nearby OpenAQ PM2.5"):
-    if not api_key or not latitude_text or not longitude_text:
-        st.error("Enter an API key, latitude, and longitude.")
+    if not api_key.strip():
+        st.error("Please enter your OpenAQ API key first.")
+    elif not latitude_text.strip() or not longitude_text.strip():
+        st.error("Please enter both Latitude and Longitude coordinates.")
     else:
         try:
             latitude = float(latitude_text)
             longitude = float(longitude_text)
-            with st.spinner("Fetching recent OpenAQ measurements"):
+            if not (-90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0):
+                raise ValueError("Latitude must be between -90 and 90, and Longitude between -180 and 180.")
+
+            with st.spinner("Searching OpenAQ sensors within 25 km and fetching hourly readings..."):
                 source, live = fetch_nearby_openaq(api_key, latitude, longitude)
 
-            # Display sensor details and required data-provider attribution
+            distance_km = (
+                f" ({source['distance'] / 1000:.1f} km away)"
+                if source.get("distance") is not None
+                else ""
+            )
             st.success(
-                f"Loaded sensor {source['sensor_id']} at {source['location']}."
+                f"Loaded sensor **{source['sensor_id']}** at **{source['location']}**{distance_km}."
             )
             st.caption(
-                f"Data source: OpenAQ. Provider: {source['provider']}. "
-                f"Attribution: {source['attribution']}."
+                f"Data source: OpenAQ | Provider: {source['provider']} | "
+                f"Attribution: {source['attribution']}"
             )
 
-            # Plot the last week of hourly readings and display the latest 24 rows in a table
-            live_chart = live.set_index("timestamp")[["value"]]
-            live_chart.columns = ["Recent hourly PM2.5"]
+            live_chart = live.set_index("timestamp")[["value"]].rename(
+                columns={"value": "Recent Hourly PM2.5 (µg/m³)"}
+            )
             st.line_chart(live_chart)
             st.dataframe(live.tail(24))
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "HTTP"
+            if status == 401 or status == 403:
+                st.error("OpenAQ authentication failed (HTTP 401/403). Please check that your OpenAQ v3 API key is valid.")
+            else:
+                st.error(f"OpenAQ server returned error ({status}): {exc}")
         except (ValueError, requests.exceptions.RequestException) as exc:
-            st.error(f"OpenAQ request failed: {exc}")
+            st.error(f"OpenAQ lookup notice: {exc}")
